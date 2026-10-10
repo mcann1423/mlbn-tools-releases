@@ -1,0 +1,189 @@
+name: Publish encrypted tools release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Semver release tag matching the manager version, such as v0.1.0
+        required: true
+        type: string
+      source_ref:
+        description: Full 40-character commit SHA from the private source repository
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    environment: production-release
+    steps:
+      - name: Validate immutable inputs
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw 'release_tag must be a semantic version such as v0.1.0.'
+          }
+          if ($env:SOURCE_REF -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'source_ref must be a full 40-character commit SHA.'
+          }
+
+      - name: Check out private source at exact commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcann1423/mlbn-admin-tools
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.MLBN_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+
+      - name: Verify source and release versions
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $actualRef = (git -C source rev-parse HEAD).Trim()
+          if ($actualRef -ne $env:SOURCE_REF.ToLowerInvariant()) {
+            throw "Checked-out source $actualRef does not match requested commit."
+          }
+          $managerVersion = (Get-Content source/src/Manager/manager.version -Raw).Trim()
+          if ("v$managerVersion" -ne $env:RELEASE_TAG) {
+            throw "Release tag $env:RELEASE_TAG does not match manager version $managerVersion."
+          }
+
+      - name: Install pinned PowerShell 7 test tools
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force
+
+      - name: Install pinned Windows PowerShell 5.1 test tools
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+
+      - name: Test under PowerShell 7
+        shell: pwsh
+        working-directory: source
+        run: |
+          $result = Invoke-Pester -Path ./tests -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Test under Windows PowerShell 5.1
+        shell: powershell
+        working-directory: source
+        run: |
+          Import-Module Pester -RequiredVersion 5.7.1
+          $result = Invoke-Pester -Path ./tests -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Analyze PowerShell
+        shell: pwsh
+        working-directory: source
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning -Settings ./PSScriptAnalyzerSettings.psd1
+          $issues | Format-Table -AutoSize
+          if ($issues | Where-Object Severity -eq Error) { exit 1 }
+
+      - name: Build and verify encrypted release assets
+        shell: pwsh
+        working-directory: source
+        env:
+          DISTRIBUTION_PASSWORD: ${{ secrets.MLBN_DISTRIBUTION_PASSWORD }}
+        run: |
+          $password = ConvertTo-SecureString $env:DISTRIBUTION_PASSWORD -AsPlainText -Force
+          ./build/New-MLBNManagerArchive.ps1 -Passphrase $password
+          ./build/New-MLBNPackage.ps1 -SourceDirectory ./packages/rsat -OutputDirectory ./dist -Passphrase $password
+          ./build/New-MLBNCatalog.ps1 -MetadataDirectory ./dist -OutputPath ./dist/catalog.mlbn -Passphrase $password
+          Copy-Item ./installer/Install-MLBNTools.cmd ./dist/Install-MLBNTools.cmd
+
+          Import-Module ./src/Manager/MLBN.Tools.Core.psm1 -Force
+          $catalog = Read-MLBNCatalog -EncryptedCatalogPath ./dist/catalog.mlbn -Passphrase $password
+          if (@($catalog.packages).Count -ne 1 -or $catalog.packages[0].id -ne 'rsat') {
+            throw 'Encrypted catalog does not contain exactly the expected RSAT package.'
+          }
+
+          $managerPlain = Unprotect-MLBNBytes -Envelope ([IO.File]::ReadAllBytes('./dist/mlbn-tools-manager.mlbn')) -Passphrase $password
+          $packagePath = Join-Path ./dist ([string]$catalog.packages[0].asset)
+          $packagePlain = Unprotect-MLBNBytes -Envelope ([IO.File]::ReadAllBytes($packagePath)) -Passphrase $password
+          try {
+            if ($managerPlain.Length -lt 4 -or $managerPlain[0] -ne 0x50 -or $managerPlain[1] -ne 0x4b) {
+              throw 'Decrypted manager payload is not a ZIP archive.'
+            }
+            if ($packagePlain.Length -lt 4 -or $packagePlain[0] -ne 0x50 -or $packagePlain[1] -ne 0x4b) {
+              throw 'Decrypted RSAT payload is not a ZIP archive.'
+            }
+            $encryptedPackageHash = Get-MLBNSha256 -LiteralPath $packagePath
+            if ($encryptedPackageHash -ne [string]$catalog.packages[0].encryptedSha256) {
+              throw 'Encrypted RSAT package hash does not match the catalog.'
+            }
+          }
+          finally {
+            [Array]::Clear($managerPlain, 0, $managerPlain.Length)
+            [Array]::Clear($packagePlain, 0, $packagePlain.Length)
+          }
+
+          Remove-Item ./dist/*.metadata.json -Force
+          $releaseAssets = @(Get-ChildItem ./dist -File | Where-Object Extension -in '.mlbn', '.cmd' | Sort-Object Name)
+          foreach ($asset in $releaseAssets) {
+            $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
+            "$digest  $($asset.Name)" | Set-Content -LiteralPath "$($asset.FullName).sha256" -Encoding ASCII
+          }
+
+          $expected = @(
+            'Install-MLBNTools.cmd',
+            'catalog.mlbn',
+            'mlbn-tools-manager.mlbn',
+            'rsat-1.0.0.mlbn'
+          )
+          $actual = @($releaseAssets.Name)
+          if (Compare-Object $expected $actual) {
+            throw "Unexpected release asset set: $($actual -join ', ')"
+          }
+
+      - name: Publish immutable GitHub release
+        shell: pwsh
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          & gh release view $env:RELEASE_TAG --repo mcann1423/mlbn-tools-releases *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists."
+          }
+
+          @"
+          # MLBN Tools $env:RELEASE_TAG
+
+          Initial encrypted distribution of the MLBN script manager and RSAT installer.
+
+          - Password-authenticated encrypted manager, catalog, and RSAT package
+          - One-file Windows bootstrapper
+          - SHA-256 sidecar for every published asset
+          - Built from private source commit ``$env:SOURCE_REF``
+
+          These files are not Authenticode-signed. Verify the bootstrapper SHA-256 before use and obtain the distribution password through the approved private channel.
+          "@ | Set-Content ./dist/release-notes.md -Encoding UTF8
+
+          $assetPaths = @(Get-ChildItem ./dist -File | Where-Object { $_.Name -ne 'release-notes.md' } | Sort-Object Name | ForEach-Object FullName)
+          & gh release create $env:RELEASE_TAG @assetPaths `
+            --repo mcann1423/mlbn-tools-releases `
+            --target main `
+            --title "MLBN Tools $env:RELEASE_TAG" `
+            --notes-file ./dist/release-notes.md `
+            --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
