@@ -17,6 +17,8 @@ Download `Install-MLBNTools.cmd` and its matching `.sha256` file from the latest
 
 Unsigned PowerShell is launched with a process-scoped execution-policy bypass. The installer does not change the machine or user execution policy.
 
+After the current manager is installed, users can initiate future manager updates from MLBN Tools. Utility selection precedes action selection; persistent utilities can be installed, updated, or removed, while setup actions run directly from the manager.
+
 ## Trust boundary
 
 The packages are not Authenticode-signed. Confidentiality and integrity depend on custody of the shared distribution password, authenticated encryption, GitHub release transport, and published SHA-256 digests. Do not redistribute decrypted scripts or the password.

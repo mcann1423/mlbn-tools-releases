@@ -117,6 +117,7 @@ jobs:
           $catalog = Read-MLBNCatalog -EncryptedCatalogPath ./dist/catalog.mlbn -Passphrase $password
           $expectedPackages = @{
             'get-user-status' = 'persistent'
+            'laps-password' = 'persistent'
             'rsat' = 'action'
           }
           if (@($catalog.packages).Count -ne $expectedPackages.Count) {
@@ -169,6 +170,7 @@ jobs:
             'Install-MLBNTools.cmd',
             'catalog.mlbn',
             'get-user-status-1.0.0.mlbn',
+            'laps-password-1.0.0.mlbn',
             'mlbn-tools-manager.mlbn',
             'rsat-1.1.0.mlbn'
           )
@@ -193,11 +195,13 @@ jobs:
           @"
           # MLBN Tools $env:RELEASE_TAG
 
-          Adds manager-only setup actions and the first persistent MLBN utility.
+          Adds user-initiated manager self-updates and Windows LAPS password lookup.
 
           - Distribution password is entered only in the one-file installer and retained with per-user Windows DPAPI
+          - MLBN Tools can securely check for and stage its own manager updates
+          - Utility-first menus show only actions valid for the selected utility
           - RSAT Tools Setup runs on demand inside MLBN Tools without installing a separate shortcut
-          - GetUserStatus installs persistently with a thin launcher and desktop shortcut
+          - GetUserStatus and LAPS Password Lookup install with thin launchers and desktop shortcuts
           - SHA-256 sidecar for every published asset
           - Built from private source commit ``$env:SOURCE_REF``
 
