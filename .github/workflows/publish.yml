@@ -105,34 +105,57 @@ jobs:
         run: |
           $password = ConvertTo-SecureString $env:DISTRIBUTION_PASSWORD -AsPlainText -Force
           ./build/New-MLBNManagerArchive.ps1 -Passphrase $password
-          ./build/New-MLBNPackage.ps1 -SourceDirectory ./packages/rsat -OutputDirectory ./dist -Passphrase $password
+          Get-ChildItem ./packages -Directory | Where-Object {
+            Test-Path (Join-Path $_.FullName 'package.template.json')
+          } | ForEach-Object {
+            ./build/New-MLBNPackage.ps1 -SourceDirectory $_.FullName -OutputDirectory ./dist -Passphrase $password
+          }
           ./build/New-MLBNCatalog.ps1 -MetadataDirectory ./dist -OutputPath ./dist/catalog.mlbn -Passphrase $password
           Copy-Item ./installer/Install-MLBNTools.cmd ./dist/Install-MLBNTools.cmd
 
           Import-Module ./src/Manager/MLBN.Tools.Core.psm1 -Force
           $catalog = Read-MLBNCatalog -EncryptedCatalogPath ./dist/catalog.mlbn -Passphrase $password
-          if (@($catalog.packages).Count -ne 1 -or $catalog.packages[0].id -ne 'rsat') {
-            throw 'Encrypted catalog does not contain exactly the expected RSAT package.'
+          $expectedPackages = @{
+            'get-user-status' = 'persistent'
+            'rsat' = 'action'
+          }
+          if (@($catalog.packages).Count -ne $expectedPackages.Count) {
+            throw 'Encrypted catalog does not contain the expected number of packages.'
+          }
+          foreach ($package in @($catalog.packages)) {
+            if (-not $expectedPackages.ContainsKey([string]$package.id) -or
+                $expectedPackages[[string]$package.id] -ne [string]$package.installMode) {
+              throw "Unexpected package role: $($package.id) / $($package.installMode)."
+            }
           }
 
           $managerPlain = Unprotect-MLBNBytes -Envelope ([IO.File]::ReadAllBytes('./dist/mlbn-tools-manager.mlbn')) -Passphrase $password
-          $packagePath = Join-Path ./dist ([string]$catalog.packages[0].asset)
-          $packagePlain = Unprotect-MLBNBytes -Envelope ([IO.File]::ReadAllBytes($packagePath)) -Passphrase $password
           try {
             if ($managerPlain.Length -lt 4 -or $managerPlain[0] -ne 0x50 -or $managerPlain[1] -ne 0x4b) {
               throw 'Decrypted manager payload is not a ZIP archive.'
             }
-            if ($packagePlain.Length -lt 4 -or $packagePlain[0] -ne 0x50 -or $packagePlain[1] -ne 0x4b) {
-              throw 'Decrypted RSAT payload is not a ZIP archive.'
-            }
-            $encryptedPackageHash = Get-MLBNSha256 -LiteralPath $packagePath
-            if ($encryptedPackageHash -ne [string]$catalog.packages[0].encryptedSha256) {
-              throw 'Encrypted RSAT package hash does not match the catalog.'
+            foreach ($package in @($catalog.packages)) {
+              $packagePath = Join-Path ./dist ([string]$package.asset)
+              $packagePlain = $null
+              $packagePlain = Unprotect-MLBNBytes -Envelope ([IO.File]::ReadAllBytes($packagePath)) -Passphrase $password
+              try {
+                if ($packagePlain.Length -lt 4 -or $packagePlain[0] -ne 0x50 -or $packagePlain[1] -ne 0x4b) {
+                  throw "Decrypted $($package.id) payload is not a ZIP archive."
+                }
+                $encryptedPackageHash = Get-MLBNSha256 -LiteralPath $packagePath
+                if ($encryptedPackageHash -ne [string]$package.encryptedSha256) {
+                  throw "Encrypted $($package.id) package hash does not match the catalog."
+                }
+              }
+              finally {
+                if ($null -ne $packagePlain) {
+                  [Array]::Clear($packagePlain, 0, $packagePlain.Length)
+                }
+              }
             }
           }
           finally {
             [Array]::Clear($managerPlain, 0, $managerPlain.Length)
-            [Array]::Clear($packagePlain, 0, $packagePlain.Length)
           }
 
           Remove-Item ./dist/*.metadata.json -Force
@@ -145,8 +168,9 @@ jobs:
           $expected = @(
             'Install-MLBNTools.cmd',
             'catalog.mlbn',
+            'get-user-status-1.0.0.mlbn',
             'mlbn-tools-manager.mlbn',
-            'rsat-1.0.0.mlbn'
+            'rsat-1.1.0.mlbn'
           )
           $actual = @($releaseAssets.Name)
           if (Compare-Object $expected $actual) {
@@ -169,10 +193,11 @@ jobs:
           @"
           # MLBN Tools $env:RELEASE_TAG
 
-          Initial encrypted distribution of the MLBN script manager and RSAT installer.
+          Adds manager-only setup actions and the first persistent MLBN utility.
 
-          - Password-authenticated encrypted manager, catalog, and RSAT package
-          - One-file Windows bootstrapper
+          - Distribution password is entered only in the one-file installer and retained with per-user Windows DPAPI
+          - RSAT Tools Setup runs on demand inside MLBN Tools without installing a separate shortcut
+          - GetUserStatus installs persistently with a thin launcher and desktop shortcut
           - SHA-256 sidecar for every published asset
           - Built from private source commit ``$env:SOURCE_REF``
 
