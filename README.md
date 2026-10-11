@@ -13,7 +13,7 @@ The source code, tests, and build tooling are maintained separately in a private
 
 ## Installation
 
-Download `Install-MLBNTools.cmd` and its matching `.sha256` file from the latest release. Verify the SHA-256 digest, then double-click the installer and enter the distribution password when prompted.
+Download `Install-MLBNTools.cmd` and its matching `.sha256` file from the latest release. Verify the SHA-256 digest, then double-click the installer and enter the distribution password when prompted. The installer protects the validated password with Windows DPAPI for that user, so MLBN Tools does not ask for it again.
 
 Unsigned PowerShell is launched with a process-scoped execution-policy bypass. The installer does not change the machine or user execution policy.
 
