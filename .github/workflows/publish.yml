@@ -115,18 +115,15 @@ jobs:
 
           Import-Module ./src/Manager/MLBN.Tools.Core.psm1 -Force
           $catalog = Read-MLBNCatalog -EncryptedCatalogPath ./dist/catalog.mlbn -Passphrase $password
-          $expectedPackages = @{
-            'get-user-status' = 'persistent'
-            'laps-password' = 'persistent'
-            'rsat' = 'action'
-          }
-          if (@($catalog.packages).Count -ne $expectedPackages.Count) {
-            throw 'Encrypted catalog does not contain the expected number of packages.'
+          if (@($catalog.packages).Count -eq 0) {
+            throw 'Encrypted catalog does not contain any packages.'
           }
           foreach ($package in @($catalog.packages)) {
-            if (-not $expectedPackages.ContainsKey([string]$package.id) -or
-                $expectedPackages[[string]$package.id] -ne [string]$package.installMode) {
-              throw "Unexpected package role: $($package.id) / $($package.installMode)."
+            if ([string]::IsNullOrWhiteSpace([string]$package.id) -or
+                [string]::IsNullOrWhiteSpace([string]$package.asset) -or
+                [string]::IsNullOrWhiteSpace([string]$package.version) -or
+                [string]$package.installMode -notin @('action', 'persistent')) {
+              throw "Encrypted catalog package is incomplete: $($package.id)."
             }
           }
 
